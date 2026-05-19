@@ -30,17 +30,23 @@ pip install \
     accelerate \
     bitsandbytes \
     huggingface_hub \
-    sentencepiece
+    sentencepiece \
+    sentence-transformers \
+    faiss-cpu \
+    tqdm
 
 echo ""
 echo "Verifying..."
 python3 -c "
 import torch, transformers, accelerate, bitsandbytes, huggingface_hub
-print('torch           :', torch.__version__)
-print('transformers    :', transformers.__version__)
-print('accelerate      :', accelerate.__version__)
-print('bitsandbytes    :', bitsandbytes.__version__)
-print('huggingface_hub :', huggingface_hub.__version__)
-print('CUDA available  :', torch.cuda.is_available())
+import sentence_transformers, faiss, tqdm
+print('torch               :', torch.__version__)
+print('transformers        :', transformers.__version__)
+print('accelerate          :', accelerate.__version__)
+print('bitsandbytes        :', bitsandbytes.__version__)
+print('huggingface_hub     :', huggingface_hub.__version__)
+print('sentence-transformers:', sentence_transformers.__version__)
+print('tqdm                :', tqdm.__version__)
+print('CUDA available      :', torch.cuda.is_available())
 "
 echo "Done. You can now run: qsub eval-tourism.pbs"
