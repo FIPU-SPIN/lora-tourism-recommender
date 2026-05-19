@@ -7,3 +7,5 @@ __pycache__/prompt-eval-tourism.cpython-36.pyc
 .claude
 
 tourism_prompt_eval.*
+
+prompt_results

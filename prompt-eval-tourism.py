@@ -54,8 +54,8 @@ Output schema (strict):
       "name": "<exact place name from candidates>",
       "type": "<place type>",
       "score": <integer 0-100>,
-            "short_answer": "<very short answer>",
-      "reason": "<short grounded reason>",
+      "short_answer": "<personalized 1-2 sentence reply the user sees, e.g. Based on your love of X and Y style, <name> is a great match because ...>",
+      "reason": "<internal 1 sentence justification citing specific matched tags, rating, or price that drove the score>",
       "matched_tags": ["<tag1>", "<tag2>"]
     }}
   ]
@@ -64,8 +64,8 @@ Output schema (strict):
 Rules:
 1. Return exactly {top_k} recommendations whenever enough candidates exist.
 2. Use exact place names from candidates.
-3. Ground reasons in the provided profile preferences and candidate metadata.
-4. Keep short_answer concise (max 8 words) and reason concise (1 sentence).
+3. Ground short_answer in the user's persona, travel_style, and top likes. It is the message the user reads.
+4. Ground reason in the candidate's specific tags, rating, or price that matched the profile.
 5. Do not output any text before or after JSON.
 6. Do not use <think> tags.
 """.strip()
@@ -267,17 +267,13 @@ def filter_and_score_candidates(
 def candidate_block(candidates: List[Place]) -> str:
     rows = []
     for p in candidates:
-        address_parts = [x for x in [p.street, p.housenumber] if x]
-        address = " ".join(address_parts) if address_parts else "unknown"
         payload = {
             "name": p.name,
             "type": p.place_type,
             "rating": p.rating,
             "price": p.price,
             "tags": p.tags,
-            "address": address,
-            "opening_hours": p.opening_hours,
-            "description": p.description[:240] if p.description else "",
+            "description": p.description[:120] if p.description else "",
         }
         rows.append(payload)
     return json.dumps(rows, ensure_ascii=False)
@@ -408,6 +404,146 @@ def generate_response(
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
+def batch_generate_transformers(
+    model,
+    tokenizer,
+    system_prompt: str,
+    user_prompts: List[str],
+    max_new_tokens: int,
+    do_sample: bool,
+    temperature: float,
+) -> List[str]:
+    import torch
+
+    conversations = [
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": up},
+        ]
+        for up in user_prompts
+    ]
+
+    try:
+        prompts = [
+            tokenizer.apply_chat_template(
+                conv,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            for conv in conversations
+        ]
+    except Exception:
+        prompts = [
+            f"{system_prompt}\n\nUser: {up}\n\nAssistant:"
+            for up in user_prompts
+        ]
+
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    input_lens = inputs["attention_mask"].sum(dim=1)
+    inputs = inputs.to(model.device)
+
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+    if do_sample:
+        gen_kwargs["temperature"] = temperature
+
+    with torch.inference_mode():
+        outputs = model.generate(**inputs, **gen_kwargs)
+
+    decoded: List[str] = []
+    for i in range(outputs.shape[0]):
+        new_tokens = outputs[i][int(input_lens[i]):]
+        decoded.append(tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
+    return decoded
+
+
+def load_vllm_model(
+    model_id: str,
+    gpu_memory_utilization: float = 0.92,
+    max_model_len: int = 16384,
+):
+    import os
+
+    # Some schedulers expose CUDA_VISIBLE_DEVICES as GPU UUIDs (GPU-...)
+    # while vLLM expects logical integer indices. Remap to 0..N-1 if needed.
+    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if raw_visible:
+        gpu_ids = [x.strip() for x in raw_visible.split(",") if x.strip()]
+        if gpu_ids and all(g.startswith("GPU-") for g in gpu_ids):
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(i) for i in range(len(gpu_ids))
+            )
+            print(
+                "Detected UUID-based CUDA_VISIBLE_DEVICES; remapped to "
+                f"logical indices: {os.environ['CUDA_VISIBLE_DEVICES']}"
+            )
+
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    
+    from vllm import LLM
+
+    visible_devices = [
+        d.strip()
+        for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if d.strip()
+    ]
+    n_gpus = len(visible_devices) if visible_devices else 1
+    print(f"Loading vLLM model '{model_id}' on {n_gpus} GPUs (tensor_parallel_size={n_gpus})")
+    llm = LLM(
+        model=model_id,
+        tensor_parallel_size=n_gpus,
+        dtype="bfloat16",
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        trust_remote_code=True,
+    )
+    return llm
+
+
+def batch_generate_vllm(
+    llm,
+    system_prompt: str,
+    user_prompts: List[str],
+    max_new_tokens: int,
+    do_sample: bool,
+    temperature: float,
+) -> List[str]:
+    from vllm import SamplingParams
+
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature if do_sample else 0.0,
+    )
+
+    conversations = [
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": up},
+        ]
+        for up in user_prompts
+    ]
+
+    # Disable Qwen3 chain-of-thought thinking if the chat template supports it.
+    try:
+        outputs = llm.chat(
+            conversations,
+            sampling_params,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+    except TypeError:
+        outputs = llm.chat(conversations, sampling_params)
+
+    return [o.outputs[0].text.strip() for o in outputs]
+
+
 def extract_json_payload(text: str) -> Tuple[Dict[str, Any], str]:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"<｜begin▁of▁sentence｜>.*?<｜Assistant｜>", "", cleaned, flags=re.DOTALL)
@@ -471,8 +607,6 @@ def normalize_recommendation_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
     short_answer = str(item.get("short_answer") or item.get("short") or "").strip()
     reason = str(item.get("reason", "")).strip()
-    if not short_answer:
-        short_answer = reason
 
     return {
         "name": str(name).strip(),
@@ -484,21 +618,62 @@ def normalize_recommendation_item(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_heuristic_payload(candidates: List[Place], top_k: int, reason: str) -> Dict[str, Any]:
+def build_heuristic_payload(
+    candidates: List[Place],
+    top_k: int,
+    reason: str,
+    profile: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     picks = candidates[:top_k]
-    return {
-        "recommendations": [
-            {
-                "name": p.name,
-                "type": p.place_type,
-                "score": max(50, 85 - i),
-                "short_answer": "Good fit for your preferences.",
-                "reason": reason,
-                "matched_tags": [],
-            }
-            for i, p in enumerate(picks)
-        ]
-    }
+    likes = []
+    travel_style = ""
+    if profile:
+        likes = [str(x) for x in profile.get("likes", []) if x]
+        travel_style = str(profile.get("travel_style") or "").strip()
+
+    recs = []
+    for i, p in enumerate(picks):
+        # Build a personalized short_answer from profile info + place name
+        if likes and travel_style:
+            short_answer = (
+                f"Based on your {travel_style} travel style and love of "
+                f"{', '.join(likes[:3])}, {p.name} is a great match for you."
+            )
+        elif likes:
+            short_answer = (
+                f"Given your interest in {', '.join(likes[:3])}, "
+                f"{p.name} is a recommended choice."
+            )
+        elif travel_style:
+            short_answer = (
+                f"With your {travel_style} travel style, "
+                f"{p.name} is well suited for you."
+            )
+        else:
+            short_answer = f"{p.name} is a recommended place in Pula."
+
+        # Build a place-specific reason
+        place_parts = []
+        if p.rating is not None:
+            place_parts.append(f"rated {p.rating:.1f}")
+        if p.price:
+            place_parts.append(f"{p.price} price range")
+        if p.tags:
+            place_parts.append(f"tags: {', '.join(p.tags[:4])}")
+        place_reason = (
+            f"{p.name} was selected because it is {'; '.join(place_parts)}." if place_parts
+            else f"{p.name} was selected as a top heuristic candidate."
+        )
+
+        recs.append({
+            "name": p.name,
+            "type": p.place_type,
+            "score": max(50, 85 - i),
+            "short_answer": short_answer,
+            "reason": place_reason,
+            "matched_tags": [],
+        })
+    return {"recommendations": recs}
 
 
 def validate_recommendations(
@@ -684,15 +859,82 @@ def run(args: argparse.Namespace) -> None:
 
     model = None
     tokenizer = None
+    active_backend = args.backend
     if not args.no_model:
-        print(f"Loading model: {args.model_id}")
-        model, tokenizer = load_model_and_tokenizer(
-            args.model_id,
-            offload_folder=args.offload_folder,
-            gpu_memory_gib=args.gpu_memory_gib,
-        )
+        if active_backend == "vllm":
+            print(f"Loading vLLM model: {args.model_id}")
+            try:
+                model = load_vllm_model(
+                    args.model_id,
+                    gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                    max_model_len=args.vllm_max_model_len,
+                )
+            except Exception as e:
+                print(f"vLLM initialization failed: {e}")
+                print("Falling back to transformers backend for compatibility.")
+                active_backend = "transformers"
+                model, tokenizer = load_model_and_tokenizer(
+                    args.model_id,
+                    offload_folder=args.offload_folder,
+                    gpu_memory_gib=args.gpu_memory_gib,
+                )
+        else:
+            print(f"Loading model (transformers): {args.model_id}")
+            model, tokenizer = load_model_and_tokenizer(
+                args.model_id,
+                offload_folder=args.offload_folder,
+                gpu_memory_gib=args.gpu_memory_gib,
+            )
 
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(top_k=args.top_k)
+
+    # ── Phase 1: prepare all inputs ──────────────────────────────────────────
+    all_inputs: List[Tuple[Dict[str, Any], List[Place], str]] = []
+    for profile in profiles:
+        scored = filter_and_score_candidates(profile, places, strict_price=args.strict_price)
+        candidate_places = [x[0] for x in scored[: args.candidate_limit]]
+        user_prompt = (
+            build_user_prompt(profile, candidate_places, args.top_k)
+            if not args.no_model
+            else ""
+        )
+        all_inputs.append((profile, candidate_places, user_prompt))
+
+    # ── Phase 2: batch generation (vLLM) ─────────────────────────────────────
+    all_raw_responses: Optional[List[str]] = None
+    if active_backend == "vllm" and not args.no_model:
+        print(f"Batch-generating {len(all_inputs)} profiles with vLLM …")
+        all_raw_responses = batch_generate_vllm(
+            model,
+            system_prompt,
+            [inp[2] for inp in all_inputs],
+            max_new_tokens=args.max_new_tokens,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+        )
+        print("Generation complete.")
+    elif active_backend == "transformers" and not args.no_model:
+        print(
+            f"Batch-generating {len(all_inputs)} profiles with transformers "
+            f"(batch_size={args.transformers_batch_size}) …"
+        )
+        all_raw_responses = []
+        all_user_prompts = [inp[2] for inp in all_inputs]
+        for start in range(0, len(all_user_prompts), args.transformers_batch_size):
+            end = min(start + args.transformers_batch_size, len(all_user_prompts))
+            batch_outputs = batch_generate_transformers(
+                model,
+                tokenizer,
+                system_prompt,
+                all_user_prompts[start:end],
+                max_new_tokens=args.max_new_tokens,
+                do_sample=args.do_sample,
+                temperature=args.temperature,
+            )
+            all_raw_responses.extend(batch_outputs)
+            if end % max(10, args.progress_every) == 0 or end == len(all_user_prompts):
+                print(f"Transformers generation progress: {end}/{len(all_user_prompts)}")
+        print("Generation complete.")
 
     summary_rows: List[Dict[str, Any]] = []
     aggregate_metrics = {
@@ -714,23 +956,32 @@ def run(args: argparse.Namespace) -> None:
     start_time = datetime.now(UTC)
 
     with open(jsonl_path, "w", encoding="utf-8") as jsonl_f, open(raw_only_path, "w", encoding="utf-8") as raw_f:
-        for idx, profile in enumerate(profiles):
+        for idx, (profile, candidate_places, user_prompt) in enumerate(all_inputs):
             current = idx + 1
-            user_prompt = ""
-
-            scored = filter_and_score_candidates(profile, places, strict_price=args.strict_price)
-            candidate_places = [x[0] for x in scored[: args.candidate_limit]]
 
             if args.no_model:
                 parsed = build_heuristic_payload(
                     candidate_places,
                     args.top_k,
                     reason="Heuristic fallback recommendation.",
+                    profile=profile,
                 )
                 raw_response = json.dumps(parsed, ensure_ascii=False)
                 parse_error = ""
+            elif all_raw_responses is not None:
+                # vLLM pre-generated the full batch
+                raw_response = all_raw_responses[idx]
+                parsed, parse_error = extract_json_payload(raw_response)
+                if not parsed:
+                    parsed = build_heuristic_payload(
+                        candidate_places,
+                        args.top_k,
+                        reason="Fallback used because model response was not valid JSON.",
+                        profile=profile,
+                    )
+                    parse_error = f"{parse_error}|heuristic_fallback"
             else:
-                user_prompt = build_user_prompt(profile, candidate_places, args.top_k)
+                # Sequential transformers generation
                 raw_response = generate_response(
                     model=model,
                     tokenizer=tokenizer,
@@ -747,6 +998,7 @@ def run(args: argparse.Namespace) -> None:
                         candidate_places,
                         args.top_k,
                         reason="Fallback used because model response was not valid JSON.",
+                        profile=profile,
                     )
                     parse_error = f"{parse_error}|heuristic_fallback"
 
@@ -911,6 +1163,8 @@ def run(args: argparse.Namespace) -> None:
         "do_sample": args.do_sample,
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
+        "backend_requested": args.backend,
+        "backend_used": active_backend,
     }
 
     with open(metadata_path, "w", encoding="utf-8") as f:
@@ -921,10 +1175,12 @@ def run(args: argparse.Namespace) -> None:
     print(f"Metadata: {metadata_path}")
 
     if model is not None:
-        del model, tokenizer
+        if active_backend == "vllm":
+            del model
+        else:
+            del model, tokenizer
         try:
             import torch
-
             torch.cuda.empty_cache()
         except Exception:
             pass
@@ -937,18 +1193,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--places-file", type=str, default="pula_merged.json")
     parser.add_argument("--profiles-file", type=str, default="user_profiles.json")
     parser.add_argument("--labels-file", type=str, default="")
-    parser.add_argument("--output-dir", type=str, default="./prompt_results/tourism")
+    parser.add_argument("--output-dir", type=str, default="./prompt_results/tourism_new")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--candidate-limit", type=int, default=60)
     parser.add_argument("--max-profiles", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=900)
+    parser.add_argument("--max-new-tokens", type=int, default=450)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--strict-price", action="store_true")
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument(
+        "--transformers-batch-size",
+        type=int,
+        default=2,
+        help="Batch size for transformers backend generation (default 2).",
+    )
     parser.add_argument("--offload-folder", type=str, default="./offload")
     parser.add_argument("--gpu-memory-gib", type=int, default=36)
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="vllm",
+        choices=["vllm", "transformers"],
+        help="Inference backend. 'vllm' uses tensor parallelism across all GPUs and batch generation. "
+             "'transformers' uses pipeline-parallel HF model generation (slower, single-sample).",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.92,
+        help="Fraction of GPU memory vLLM may use (default 0.92).",
+    )
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=16384,
+        help="Maximum sequence length (input + output tokens) for vLLM. "
+             "Increase if prompts with 60 candidates exceed 16k tokens.",
+    )
     parser.add_argument(
         "--no-model",
         action="store_true",
