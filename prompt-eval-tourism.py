@@ -8,6 +8,8 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from tqdm import tqdm
+
 
 PRICE_ORDER = {"low": 0, "medium": 1, "high": 2}
 
@@ -603,6 +605,16 @@ def ndcg_at_k(pred: List[str], truth: set, k: int) -> float:
     return dcg / idcg if idcg > 0 else 0.0
 
 
+def build_final_response(query: str, recommendations: List[Dict]) -> str:
+    lines = [f'Based on your query "{query}", here are my top recommendations in Pula:\n']
+    for i, rec in enumerate(recommendations, 1):
+        name = rec.get("name", "Unknown")
+        rtype = rec.get("type", "place")
+        desc = rec.get("short_answer") or rec.get("reason", "")
+        lines.append(f"{i}. {name} ({rtype}) — {desc}")
+    return "\n".join(lines)
+
+
 def maybe_login_hf() -> None:
     try:
         from huggingface_hub import login
@@ -632,14 +644,6 @@ def write_summary_csv(rows: List[Dict[str, Any]], path: str) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-
-def format_duration(seconds: float) -> str:
-    seconds = max(0, int(round(seconds)))
-    hours, rem = divmod(seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
 
 
 def run(args: argparse.Namespace) -> None:
@@ -676,11 +680,16 @@ def run(args: argparse.Namespace) -> None:
         args.output_dir,
         f"tourism_eval_metadata_{sanitized_model_name}_{timestamp}.json",
     )
+    performance_path = os.path.join(
+        args.output_dir,
+        f"tourism_eval_performance_{sanitized_model_name}_{timestamp}.jsonl",
+    )
 
     print(f"Loaded {len(places)} places and {len(profiles)} profiles.")
     print(f"Output JSONL: {jsonl_path}")
     print(f"Output Raw JSONL: {raw_only_path}")
     print(f"Output CSV: {csv_path}")
+    print(f"Output Performance: {performance_path}")
 
     model = None
     tokenizer = None
@@ -711,10 +720,9 @@ def run(args: argparse.Namespace) -> None:
         "gold_rows": 0,
     }
 
-    start_time = datetime.now(UTC)
-
-    with open(jsonl_path, "w", encoding="utf-8") as jsonl_f, open(raw_only_path, "w", encoding="utf-8") as raw_f:
-        for idx, profile in enumerate(profiles):
+    with open(jsonl_path, "w", encoding="utf-8") as jsonl_f, open(raw_only_path, "w", encoding="utf-8") as raw_f, open(performance_path, "w", encoding="utf-8") as perf_f:
+        pbar = tqdm(profiles, desc="Evaluating", unit="profile", dynamic_ncols=True)
+        for idx, profile in enumerate(pbar):
             current = idx + 1
             user_prompt = ""
 
@@ -788,6 +796,9 @@ def run(args: argparse.Namespace) -> None:
                 aggregate_metrics["r_at_k_sum"] += r_at_k
                 aggregate_metrics["ndcg_at_k_sum"] += ndcg_k
 
+            recs = parsed.get("recommendations", []) if parsed else []
+            final_response = build_final_response(profile.get("input", ""), recs)
+
             raw_record = {
                 "user_id": user_id,
                 "query": profile.get("input"),
@@ -800,17 +811,23 @@ def run(args: argparse.Namespace) -> None:
                     "min_rating": profile.get("min_rating"),
                 },
                 "candidate_count": len(candidate_places),
-                "parse_error": parse_error,
-                "raw_response": raw_response,
-                "parsed": parsed,
-                "validated_recommendations": recommendations,
-                "row_metrics": row_metrics,
+                "recommendations": recs,
+                "final_response": final_response,
+            }
+            jsonl_f.write(json.dumps(raw_record, ensure_ascii=False) + "\n")
+            jsonl_f.flush()
+
+            perf_record = {
+                "user_id": user_id,
+                "query": profile.get("input"),
+                "persona": profile.get("persona"),
+                **row_metrics,
                 "p_at_k": p_at_k,
                 "r_at_k": r_at_k,
                 "ndcg_at_k": ndcg_k,
             }
-            jsonl_f.write(json.dumps(raw_record, ensure_ascii=False) + "\n")
-            jsonl_f.flush()
+            perf_f.write(json.dumps(perf_record, ensure_ascii=False) + "\n")
+            perf_f.flush()
 
             raw_only_record = {
                 "user_id": user_id,
@@ -829,8 +846,6 @@ def run(args: argparse.Namespace) -> None:
                 "query": profile.get("input"),
                 "persona": profile.get("persona"),
                 "travel_style": profile.get("travel_style"),
-                "valid_json": valid_json,
-                "parse_error": parse_error,
                 "candidate_count": len(candidate_places),
                 "recommendation_count": row_metrics["recommendation_count"],
                 "recommendation_validity_rate": row_metrics["recommendation_validity_rate"],
@@ -864,38 +879,22 @@ def run(args: argparse.Namespace) -> None:
             if (idx + 1) % args.save_every == 0:
                 write_summary_csv(summary_rows, csv_path)
 
-            if current % args.progress_every == 0 or current == len(profiles):
-                elapsed_sec = (datetime.now(UTC) - start_time).total_seconds()
-                avg_per_profile = elapsed_sec / max(1, current)
-                remaining = len(profiles) - current
-                eta_sec = avg_per_profile * remaining
-                parse_error_rate = aggregate_metrics["parse_error_rows"] / max(1, current)
-                fallback_rate = aggregate_metrics["fallback_rows"] / max(1, current)
-                print(
-                    f"Progress {current}/{len(profiles)} "
-                    f"({100.0 * current / len(profiles):.1f}%) | "
-                    f"elapsed {format_duration(elapsed_sec)} | "
-                    f"ETA {format_duration(eta_sec)} | "
-                    f"parse_error_rate {parse_error_rate:.3f} | "
-                    f"fallback_rate {fallback_rate:.3f}"
-                )
+            rows_so_far = max(1, current)
+            pbar.set_postfix({
+                "validity": f"{aggregate_metrics['recommendation_validity_rate_sum'] / rows_so_far:.2f}",
+                "tag_overlap": f"{aggregate_metrics['avg_tag_overlap_sum'] / rows_so_far:.2f}",
+                "rating_ok": f"{aggregate_metrics['rating_compliance_rate_sum'] / rows_so_far:.2f}",
+                "price_ok": f"{aggregate_metrics['price_compliance_rate_sum'] / rows_so_far:.2f}",
+            })
 
     write_summary_csv(summary_rows, csv_path)
 
     rows = max(1, aggregate_metrics["rows"])
     gold_rows = aggregate_metrics["gold_rows"]
-    metadata = {
-        "timestamp_utc": datetime.now(UTC).isoformat(),
-        "model_id": args.model_id,
-        "no_model": args.no_model,
-        "places_file": args.places_file,
-        "profiles_file": args.profiles_file,
-        "labels_file": args.labels_file,
-        "raw_unparsed_jsonl": raw_only_path,
+
+    aggregate_performance = {
+        "_type": "aggregate",
         "rows_processed": aggregate_metrics["rows"],
-        "valid_json_rate": aggregate_metrics["valid_json_count"] / rows,
-        "parse_error_rate": aggregate_metrics["parse_error_rows"] / rows,
-        "fallback_rate": aggregate_metrics["fallback_rows"] / rows,
         "avg_recommendation_validity_rate": aggregate_metrics["recommendation_validity_rate_sum"] / rows,
         "avg_tag_overlap": aggregate_metrics["avg_tag_overlap_sum"] / rows,
         "avg_rating_compliance_rate": aggregate_metrics["rating_compliance_rate_sum"] / rows,
@@ -905,6 +904,20 @@ def run(args: argparse.Namespace) -> None:
         "precision_at_k": (aggregate_metrics["p_at_k_sum"] / gold_rows) if gold_rows else None,
         "recall_at_k": (aggregate_metrics["r_at_k_sum"] / gold_rows) if gold_rows else None,
         "ndcg_at_k": (aggregate_metrics["ndcg_at_k_sum"] / gold_rows) if gold_rows else None,
+    }
+    with open(performance_path, "a", encoding="utf-8") as perf_f:
+        perf_f.write(json.dumps(aggregate_performance, ensure_ascii=False) + "\n")
+
+    metadata = {
+        "timestamp_utc": datetime.now(UTC).isoformat(),
+        "model_id": args.model_id,
+        "no_model": args.no_model,
+        "places_file": args.places_file,
+        "profiles_file": args.profiles_file,
+        "labels_file": args.labels_file,
+        "raw_unparsed_jsonl": raw_only_path,
+        "performance_jsonl": performance_path,
+        "rows_processed": aggregate_metrics["rows"],
         "top_k": args.top_k,
         "candidate_limit": args.candidate_limit,
         "strict_price": args.strict_price,
@@ -946,7 +959,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--strict-price", action="store_true")
     parser.add_argument("--save-every", type=int, default=25)
-    parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--offload-folder", type=str, default="./offload")
     parser.add_argument("--gpu-memory-gib", type=int, default=36)
     parser.add_argument(
