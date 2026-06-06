@@ -9,3 +9,8 @@ __pycache__/prompt-eval-tourism.cpython-36.pyc
 tourism_prompt_eval.*
 
 prompt_results
+base_results
+adapters_results
+base_eval_min.*
+tourism_adapter_train_min.*
+tourism_ia3_train_min.*

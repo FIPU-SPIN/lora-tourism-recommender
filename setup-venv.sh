@@ -18,31 +18,22 @@ source venv/bin/activate
 echo ">>> pip upgrade"
 pip install --upgrade pip
 
-echo ">>> torch (CUDA 12.1 wheel)"
-pip install \
-    torch==2.5.1 \
-    torchvision \
-    --index-url https://download.pytorch.org/whl/cu121
-
-echo ">>> transformers stack"
-pip install \
-    transformers \
-    accelerate \
-    bitsandbytes \
-    huggingface_hub \
-    sentencepiece \
-    sentence-transformers \
-    faiss-cpu \
-    tqdm
+echo ">>> install requirements"
+pip install -r requirements.txt
 
 echo ""
 echo "Verifying..."
 python3 -c "
 import torch, transformers, accelerate, bitsandbytes, huggingface_hub
+import peft, trl, datasets, pandas
 import sentence_transformers, faiss, tqdm
 print('torch               :', torch.__version__)
 print('transformers        :', transformers.__version__)
 print('accelerate          :', accelerate.__version__)
+print('peft                :', peft.__version__)
+print('trl                 :', trl.__version__)
+print('datasets            :', datasets.__version__)
+print('pandas              :', pandas.__version__)
 print('bitsandbytes        :', bitsandbytes.__version__)
 print('huggingface_hub     :', huggingface_hub.__version__)
 print('sentence-transformers:', sentence_transformers.__version__)

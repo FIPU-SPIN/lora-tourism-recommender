@@ -1,9 +1,13 @@
 import argparse
+import ast
 import gc
 import json
 import os
 import re
+import resource
+import subprocess
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -12,10 +16,21 @@ import torch
 from datasets import Dataset
 from huggingface_hub import login
 from peft import LoraConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
 PRICE_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+SYSTEM_PROMPT = (
+    "You are an intelligent tourism assistant. You recommend personalized activities to tourists based on:\n"
+    "1. The user's interests and preferences (as defined in their profile).\n"
+    "2. Their current intent or question (described in the user input).\n"
+    "3. Relevant local information retrieved via semantic search (provided as bullet points).\n"
+    "Your response should be personalized, context-aware, and practical.\n"
+    "If there are strong user preferences, make sure to respect them.\n"
+    "Respond in a friendly and informative tone. Your output should be a short and clear activity recommendation, "
+    "followed by a brief explanation if needed."
+)
 
 SYSTEM_PROMPT_TEMPLATE = """
 You are a tourism recommendation assistant for Pula, Croatia.
@@ -136,6 +151,128 @@ def load_places(file_path: str) -> List[Place]:
 def load_profiles(file_path: str) -> List[Dict[str, Any]]:
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_faiss_index(index_path: str, chunks_path: str):
+    import faiss
+    import numpy as np
+
+    index = faiss.read_index(index_path)
+    chunks = np.load(chunks_path, allow_pickle=True).tolist()
+    return index, chunks
+
+
+def load_embedding_model(model_name: str):
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
+
+
+def retrieve_chunks(
+    query: str,
+    index,
+    chunks: List[str],
+    embed_model,
+    top_k: int,
+) -> List[str]:
+    embedding = embed_model.encode([query], convert_to_numpy=True).astype("float32")
+    _, indices = index.search(embedding, top_k)
+    results = []
+    for idx in indices[0]:
+        if 0 <= idx < len(chunks):
+            results.append(str(chunks[idx]))
+    return results
+
+
+def _parse_listish(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if not isinstance(value, str):
+        return []
+
+    value = value.strip()
+    if not value:
+        return []
+
+    try:
+        parsed = ast.literal_eval(value)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except Exception:
+        pass
+
+    return [x.strip() for x in re.split(r"[;,]", value) if x.strip()]
+
+
+def _row_to_profile(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row.get("User_ID"),
+        "name": row.get("User_Name"),
+        "travel_style": row.get("User_Travel_Style"),
+        "persona": row.get("User_Persona"),
+        "likes": _parse_listish(row.get("User_Likes")),
+        "dislikes": _parse_listish(row.get("User_Dislikes")),
+        "price_preference": row.get("User_Price_Preference"),
+        "min_rating": row.get("User_Min_Rating"),
+        "input": row.get("User_Input") or "",
+    }
+
+
+def build_user_prompt_with_chunks(profile: Dict[str, Any], retrieved_chunks: List[str]) -> str:
+    profile_summary = (
+        f"Name: {profile.get('name', 'Unknown')}\n"
+        f"Travel style: {profile.get('travel_style', 'N/A')}\n"
+        f"Persona: {profile.get('persona', 'N/A')}\n"
+        f"Likes: {', '.join(profile.get('likes', [])) or 'none specified'}\n"
+        f"Dislikes: {', '.join(profile.get('dislikes', [])) or 'none specified'}\n"
+        f"Price preference: {profile.get('price_preference', 'N/A')}\n"
+        f"Minimum rating: {profile.get('min_rating', 'N/A')}"
+    )
+
+    bullets = "\n".join(f"• {c}" for c in retrieved_chunks) if retrieved_chunks else "• No relevant information found."
+    query = profile.get("input", "What do you recommend?")
+
+    return (
+        f"User profile:\n{profile_summary}\n\n"
+        f"User question: {query}\n\n"
+        f"Retrieved local information:\n{bullets}"
+    )
+
+
+def load_csv_examples_with_faiss(
+    csv_path: str,
+    faiss_index,
+    chunks: List[str],
+    embed_model,
+    retrieval_top_k: int,
+    max_rows: Optional[int],
+) -> List[Dict[str, str]]:
+    df = pd.read_csv(csv_path)
+    if max_rows is not None:
+        df = df.head(max_rows)
+
+    examples: List[Dict[str, str]] = []
+    for row in df.to_dict(orient="records"):
+        profile = _row_to_profile(row)
+        query = str(profile.get("input") or "").strip()
+        if not query:
+            continue
+
+        assistant_response = str(row.get("LLM_Response") or "").strip()
+        if not assistant_response:
+            continue
+
+        retrieved = retrieve_chunks(query, faiss_index, chunks, embed_model, retrieval_top_k)
+        user_prompt = build_user_prompt_with_chunks(profile, retrieved)
+        examples.append(
+            {
+                "system_prompt": SYSTEM_PROMPT,
+                "user_prompt": user_prompt,
+                "assistant_json": assistant_response,
+            }
+        )
+
+    return examples
 
 
 def filter_and_score_candidates(
@@ -498,7 +635,98 @@ def make_chat_text(tokenizer, system_prompt: str, user_prompt: str, assistant_js
         )
 
 
-def train_single_model(args: argparse.Namespace, model_id: str, base_examples: Sequence[Dict[str, str]]) -> None:
+def _bytes_to_mib(value: float) -> float:
+    return round(float(value) / (1024.0 * 1024.0), 2)
+
+
+def _get_current_rss_mib() -> Optional[float]:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        # VmRSS is reported in kilobytes on Linux.
+                        return round(float(parts[1]) / 1024.0, 2)
+    except Exception:
+        return None
+    return None
+
+
+def _get_rusage_snapshot() -> Dict[str, float]:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # On Linux ru_maxrss is in kilobytes.
+    return {
+        "current_rss_mib": _get_current_rss_mib(),
+        "max_rss_mib": round(float(usage.ru_maxrss) / 1024.0, 2),
+        "user_cpu_seconds": round(float(usage.ru_utime), 4),
+        "system_cpu_seconds": round(float(usage.ru_stime), 4),
+    }
+
+
+def _get_cuda_memory_snapshot() -> Dict[str, Any]:
+    if not torch.cuda.is_available():
+        return {"cuda_available": False, "devices": []}
+
+    devices = []
+    for dev_idx in range(torch.cuda.device_count()):
+        devices.append(
+            {
+                "index": dev_idx,
+                "name": torch.cuda.get_device_name(dev_idx),
+                "memory_allocated_mib": _bytes_to_mib(torch.cuda.memory_allocated(dev_idx)),
+                "memory_reserved_mib": _bytes_to_mib(torch.cuda.memory_reserved(dev_idx)),
+                "max_memory_allocated_mib": _bytes_to_mib(torch.cuda.max_memory_allocated(dev_idx)),
+                "max_memory_reserved_mib": _bytes_to_mib(torch.cuda.max_memory_reserved(dev_idx)),
+            }
+        )
+    return {"cuda_available": True, "devices": devices}
+
+
+def _get_nvidia_smi_snapshot() -> Dict[str, Any]:
+    query = (
+        "index,name,utilization.gpu,utilization.memory,memory.total,memory.used,"
+        "memory.free,temperature.gpu,power.draw"
+    )
+    cmd = [
+        "nvidia-smi",
+        f"--query-gpu={query}",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except Exception as exc:
+        return {"available": False, "error": str(exc), "gpus": []}
+
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 9:
+            continue
+        gpus.append(
+            {
+                "index": int(parts[0]),
+                "name": parts[1],
+                "gpu_utilization_percent": float(parts[2]),
+                "memory_utilization_percent": float(parts[3]),
+                "memory_total_mib": float(parts[4]),
+                "memory_used_mib": float(parts[5]),
+                "memory_free_mib": float(parts[6]),
+                "temperature_c": float(parts[7]),
+                "power_draw_w": float(parts[8]),
+            }
+        )
+    return {"available": True, "gpus": gpus}
+
+
+def train_single_model(
+    args: argparse.Namespace,
+    model_id: str,
+    train_examples: Sequence[Dict[str, str]],
+    eval_examples: Sequence[Dict[str, str]],
+) -> None:
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     model_short = extract_model_short_name(model_id)
     adapter_type = "lora"
     output_dir = os.path.join(args.output_root, f"{adapter_type}-{model_short}-checkpoints")
@@ -508,19 +736,21 @@ def train_single_model(args: argparse.Namespace, model_id: str, base_examples: S
     print(f"Training model: {model_id}")
     print("=" * 70)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     print("Formatting training text with model chat template...")
-    text_rows = [
+    train_text_rows = [
         {"text": make_chat_text(tokenizer, ex["system_prompt"], ex["user_prompt"], ex["assistant_json"])}
-        for ex in base_examples
+        for ex in train_examples
     ]
-    dataset = Dataset.from_pandas(pd.DataFrame(text_rows))
-    split = dataset.train_test_split(test_size=args.eval_ratio, seed=args.seed)
-    train_dataset = split["train"]
-    eval_dataset = split["test"]
+    eval_text_rows = [
+        {"text": make_chat_text(tokenizer, ex["system_prompt"], ex["user_prompt"], ex["assistant_json"])}
+        for ex in eval_examples
+    ]
+    train_dataset = Dataset.from_pandas(pd.DataFrame(train_text_rows))
+    eval_dataset = Dataset.from_pandas(pd.DataFrame(eval_text_rows))
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     model = AutoModelForCausalLM.from_pretrained(
@@ -528,6 +758,7 @@ def train_single_model(args: argparse.Namespace, model_id: str, base_examples: S
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
         device_map={"": local_rank},
         attn_implementation=args.attn_implementation,
+        trust_remote_code=True,
     )
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
@@ -544,7 +775,7 @@ def train_single_model(args: argparse.Namespace, model_id: str, base_examples: S
     sft_config = SFTConfig(
         output_dir=output_dir,
         dataset_text_field="text",
-        max_length=args.max_length,
+        max_seq_length=args.max_length,
         packing=False,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
@@ -582,7 +813,7 @@ def train_single_model(args: argparse.Namespace, model_id: str, base_examples: S
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         args=sft_config,
     )
 
@@ -591,12 +822,28 @@ def train_single_model(args: argparse.Namespace, model_id: str, base_examples: S
         print(f"Train/Eval samples: {len(train_dataset)}/{len(eval_dataset)}")
         trainer.model.print_trainable_parameters()
 
+    if torch.cuda.is_available():
+        for dev_idx in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(dev_idx)
+
+    rusage_start = _get_rusage_snapshot()
+    cuda_start = _get_cuda_memory_snapshot()
+    nvidia_smi_start = _get_nvidia_smi_snapshot()
+    wall_start = time.perf_counter()
+    cpu_start = time.process_time()
+
     start_time = time.time()
     trainer.train()
     elapsed = time.time() - start_time
+    wall_elapsed = time.perf_counter() - wall_start
+    cpu_elapsed = time.process_time() - cpu_start
+    rusage_end = _get_rusage_snapshot()
+    cuda_end = _get_cuda_memory_snapshot()
+    nvidia_smi_end = _get_nvidia_smi_snapshot()
 
     os.makedirs(args.adapters_dir, exist_ok=True)
     if is_main_process:
+        os.makedirs(adapter_dir, exist_ok=True)
         trainer.model.save_pretrained(adapter_dir)
         tokenizer.save_pretrained(adapter_dir)
 
@@ -621,8 +868,28 @@ def train_single_model(args: argparse.Namespace, model_id: str, base_examples: S
         metrics_path = os.path.join(adapter_dir, "training_metrics.json")
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+        performance_metrics = {
+            "model_id": model_id,
+            "adapter_dir": adapter_dir,
+            "train_samples": len(train_dataset),
+            "eval_samples": len(eval_dataset),
+            "wall_time_seconds": round(wall_elapsed, 4),
+            "cpu_time_seconds": round(cpu_elapsed, 4),
+            "rusage_start": rusage_start,
+            "rusage_end": rusage_end,
+            "cuda_start": cuda_start,
+            "cuda_end": cuda_end,
+            "nvidia_smi_start": nvidia_smi_start,
+            "nvidia_smi_end": nvidia_smi_end,
+        }
+        performance_path = os.path.join(adapter_dir, "system_performance_metrics.json")
+        with open(performance_path, "w", encoding="utf-8") as f:
+            json.dump(performance_metrics, f, ensure_ascii=False, indent=2)
+
         print(f"Saved adapter: {adapter_dir}")
         print(f"Saved metrics: {metrics_path}")
+        print(f"Saved system performance metrics: {performance_path}")
 
     del trainer, model, tokenizer
     torch.cuda.empty_cache()
@@ -632,30 +899,47 @@ def train_single_model(args: argparse.Namespace, model_id: str, base_examples: S
         torch.distributed.barrier()
 
 
+def check_model_compatibility(model_id: str) -> Tuple[bool, Optional[str]]:
+    try:
+        AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train LoRA adapters for tourism recommendations")
 
-    parser.add_argument("--model-ids", type=str, default="meta-llama/Llama-3.2-3B-Instruct")
+    parser.add_argument(
+        "--model-ids",
+        type=str,
+        default="meta-llama/Meta-Llama-3.1-8B-Instruct,meta-llama/Llama-3.2-3B-Instruct,Qwen/Qwen3-4B",
+    )
     parser.add_argument("--places-file", type=str, default="pula_merged.json")
     parser.add_argument("--profiles-file", type=str, default="user_profiles.json")
+    parser.add_argument("--train-dataset-file", type=str, default="split_1_both1_2609.csv")
+    parser.add_argument("--eval-dataset-file", type=str, default="split_2_both1_870.csv")
+    parser.add_argument("--faiss-index", type=str, default="faiss_index.bin")
+    parser.add_argument("--chunks-file", type=str, default="chunks.npy")
+    parser.add_argument("--embed-model", type=str, default="sentence-transformers/all-mpnet-base-v2")
+    parser.add_argument("--retrieval-top-k", type=int, default=5)
     parser.add_argument(
         "--teaching-dataset-file",
         type=str,
         default="",
         help="Optional JSON file with gold recommendations per profile. If set, this is used instead of heuristic labels.",
     )
-    parser.add_argument("--output-root", type=str, default="./checkpoints")
-    parser.add_argument("--adapters-dir", type=str, default="./adapters")
+    parser.add_argument("--output-root", type=str, default="./adapters_results/ollama/checkpoints")
+    parser.add_argument("--adapters-dir", type=str, default="./adapters_results/ollama/adapters")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--candidate-limit", type=int, default=60)
     parser.add_argument("--strict-price", action="store_true")
     parser.add_argument("--max-profiles", type=int, default=None)
-    parser.add_argument("--eval-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--max-length", type=int, default=1024)
-    parser.add_argument("--per-device-train-batch-size", type=int, default=4)
-    parser.add_argument("--per-device-eval-batch-size", type=int, default=4)
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=1)
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--num-train-epochs", type=int, default=3)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -675,7 +959,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--tf32", action="store_true")
-    parser.add_argument("--attn-implementation", type=str, default="eager")
+    parser.add_argument("--attn-implementation", type=str, default="sdpa")
 
     return parser.parse_args()
 
@@ -689,38 +973,70 @@ def main() -> None:
     if not model_ids:
         raise ValueError("--model-ids must contain at least one model")
 
-    places = load_places(args.places_file)
-    profiles = load_profiles(args.profiles_file)
-    print(f"Loaded places/profiles: {len(places)}/{len(profiles)}")
+    print(f"Loading FAISS index from {args.faiss_index} and chunks from {args.chunks_file}")
+    faiss_index, chunks = load_faiss_index(args.faiss_index, args.chunks_file)
+    print(f"Loaded {len(chunks)} chunks")
+    print(f"Loading embedding model: {args.embed_model}")
+    embed_model = load_embedding_model(args.embed_model)
 
-    if args.teaching_dataset_file:
-        print(f"Using teaching dataset: {args.teaching_dataset_file}")
-        base_examples = load_teaching_examples(
-            teaching_file=args.teaching_dataset_file,
-            places=places,
-            top_k=args.top_k,
-            candidate_limit=args.candidate_limit,
-            strict_price=args.strict_price,
-            max_profiles=args.max_profiles,
-        )
-    else:
-        print("No teaching dataset provided, using heuristic pseudo-labels from profiles + places.")
-        base_examples = build_training_examples(
-            profiles=profiles,
-            places=places,
-            top_k=args.top_k,
-            candidate_limit=args.candidate_limit,
-            strict_price=args.strict_price,
-            max_profiles=args.max_profiles,
-        )
-    if not base_examples:
-        raise ValueError("No training examples generated")
+    print(f"Building train examples from: {args.train_dataset_file}")
+    train_examples = load_csv_examples_with_faiss(
+        csv_path=args.train_dataset_file,
+        faiss_index=faiss_index,
+        chunks=chunks,
+        embed_model=embed_model,
+        retrieval_top_k=args.retrieval_top_k,
+        max_rows=args.max_profiles,
+    )
+    print(f"Building eval examples from: {args.eval_dataset_file}")
+    eval_examples = load_csv_examples_with_faiss(
+        csv_path=args.eval_dataset_file,
+        faiss_index=faiss_index,
+        chunks=chunks,
+        embed_model=embed_model,
+        retrieval_top_k=args.retrieval_top_k,
+        max_rows=args.max_profiles,
+    )
 
-    print(f"Prepared recommendation examples: {len(base_examples)}")
+    if not train_examples:
+        raise ValueError("No training examples generated from train CSV")
+    if not eval_examples:
+        raise ValueError("No validation examples generated from eval CSV")
+
+    print(f"Prepared recommendation examples train/eval: {len(train_examples)}/{len(eval_examples)}")
+    failed_models: List[str] = []
+    skipped_models: List[str] = []
     for model_id in model_ids:
-        train_single_model(args, model_id, base_examples)
+        is_compatible, compatibility_error = check_model_compatibility(model_id)
+        if not is_compatible:
+            skipped_models.append(model_id)
+            print("=" * 70)
+            print(f"Skipping unsupported model: {model_id}")
+            print(f"Reason: {compatibility_error}")
+            print("Continuing with next model...")
+            print("=" * 70)
+            continue
+        try:
+            train_single_model(args, model_id, train_examples, eval_examples)
+        except Exception as exc:
+            failed_models.append(model_id)
+            print("=" * 70)
+            print(f"Training failed for model: {model_id}")
+            print(f"Error: {exc}")
+            traceback.print_exc()
+            print("Continuing with next model...")
+            print("=" * 70)
 
-    print("All requested models finished.")
+    if failed_models:
+        print("Run completed with failures in the following model(s):")
+        for model_id in failed_models:
+            print(f"  - {model_id}")
+    if skipped_models:
+        print("Run skipped unsupported model(s):")
+        for model_id in skipped_models:
+            print(f"  - {model_id}")
+    if not failed_models and not skipped_models:
+        print("All requested models finished successfully.")
 
 
 if __name__ == "__main__":

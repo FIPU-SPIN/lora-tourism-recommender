@@ -1,9 +1,13 @@
 import argparse
+import ast
 import csv
 import gc
 import json
 import os
 import re
+import resource
+import subprocess
+import time
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,13 +26,181 @@ SYSTEM_PROMPT = (
 )
 
 
+RERANK_OUTPUT_FIELDS = [
+    "User_ID",
+    "User_Name",
+    "User_Age",
+    "User_Gender",
+    "User_Nationality",
+    "User_Travel_Style",
+    "User_Persona",
+    "User_Likes",
+    "User_Dislikes",
+    "User_Price_Preference",
+    "User_Min_Rating",
+    "User_Input",
+    "Relevant_Information",
+    "LLM_Response",
+]
+
+
 def normalize_token(text: str) -> str:
     return re.sub(r"\s+", " ", str(text).strip().lower())
 
 
+def strip_think_sections(text: str) -> str:
+    """Remove Qwen-style <think>...</think> blocks from a response."""
+    if not text:
+        return ""
+
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _parse_listish(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if not isinstance(value, str):
+        return []
+
+    text = value.strip()
+    if not text:
+        return []
+
+    try:
+        parsed = ast.literal_eval(text)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except Exception:
+        pass
+
+    return [x.strip() for x in re.split(r"[;,]", text) if x.strip()]
+
+
+def _profile_from_csv_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row.get("User_ID"),
+        "name": row.get("User_Name"),
+        "travel_style": row.get("User_Travel_Style"),
+        "persona": row.get("User_Persona"),
+        "likes": _parse_listish(row.get("User_Likes")),
+        "dislikes": _parse_listish(row.get("User_Dislikes")),
+        "price_preference": row.get("User_Price_Preference"),
+        "min_rating": row.get("User_Min_Rating"),
+        "input": row.get("User_Input") or "",
+    }
+
+
 def load_profiles(file_path: str) -> List[Dict[str, Any]]:
+    if file_path.lower().endswith(".csv"):
+        with open(file_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            return [_profile_from_csv_row(row) for row in reader]
+
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _bytes_to_mib(value: float) -> float:
+    return round(float(value) / (1024.0 * 1024.0), 2)
+
+
+def _get_current_rss_mib() -> Optional[float]:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        # VmRSS is reported in kilobytes on Linux.
+                        return round(float(parts[1]) / 1024.0, 2)
+    except Exception:
+        return None
+    return None
+
+
+def _get_rusage_snapshot() -> Dict[str, float]:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # On Linux ru_maxrss is in kilobytes.
+    return {
+        "current_rss_mib": _get_current_rss_mib(),
+        "max_rss_mib": round(float(usage.ru_maxrss) / 1024.0, 2),
+        "user_cpu_seconds": round(float(usage.ru_utime), 4),
+        "system_cpu_seconds": round(float(usage.ru_stime), 4),
+    }
+
+
+def _get_cuda_memory_snapshot() -> Dict[str, Any]:
+    try:
+        import torch
+    except Exception:
+        return {"cuda_available": False, "devices": [], "error": "torch-not-available"}
+
+    if not torch.cuda.is_available():
+        return {"cuda_available": False, "devices": []}
+
+    devices = []
+    for dev_idx in range(torch.cuda.device_count()):
+        devices.append(
+            {
+                "index": dev_idx,
+                "name": torch.cuda.get_device_name(dev_idx),
+                "memory_allocated_mib": _bytes_to_mib(torch.cuda.memory_allocated(dev_idx)),
+                "memory_reserved_mib": _bytes_to_mib(torch.cuda.memory_reserved(dev_idx)),
+                "max_memory_allocated_mib": _bytes_to_mib(torch.cuda.max_memory_allocated(dev_idx)),
+                "max_memory_reserved_mib": _bytes_to_mib(torch.cuda.max_memory_reserved(dev_idx)),
+            }
+        )
+    return {"cuda_available": True, "devices": devices}
+
+
+def _reset_cuda_peak_stats() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            for dev_idx in range(torch.cuda.device_count()):
+                torch.cuda.reset_peak_memory_stats(dev_idx)
+    except Exception:
+        pass
+
+
+def _get_nvidia_smi_snapshot() -> Dict[str, Any]:
+    query = (
+        "index,name,utilization.gpu,utilization.memory,memory.total,memory.used,"
+        "memory.free,temperature.gpu,power.draw"
+    )
+    cmd = [
+        "nvidia-smi",
+        f"--query-gpu={query}",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+    except Exception as exc:
+        return {"available": False, "error": str(exc), "gpus": []}
+
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 9:
+            continue
+        gpus.append(
+            {
+                "index": int(parts[0]),
+                "name": parts[1],
+                "gpu_utilization_percent": float(parts[2]),
+                "memory_utilization_percent": float(parts[3]),
+                "memory_total_mib": float(parts[4]),
+                "memory_used_mib": float(parts[5]),
+                "memory_free_mib": float(parts[6]),
+                "temperature_c": float(parts[7]),
+                "power_draw_w": float(parts[8]),
+            }
+        )
+    return {"available": True, "gpus": gpus}
 
 
 def load_faiss_index(index_path: str, chunks_path: str):
@@ -44,6 +216,16 @@ def load_embedding_model(model_name: str):
     from sentence_transformers import SentenceTransformer
 
     return SentenceTransformer(model_name)
+
+
+def get_embedding_dimension(embed_model) -> int:
+    dim = None
+    if hasattr(embed_model, "get_sentence_embedding_dimension"):
+        dim = embed_model.get_sentence_embedding_dimension()
+    if dim is None:
+        sample = embed_model.encode(["dimension probe"], convert_to_numpy=True)
+        dim = int(sample.shape[1])
+    return int(dim)
 
 
 def retrieve_chunks(
@@ -86,6 +268,49 @@ def build_user_prompt(profile: Dict[str, Any], retrieved_chunks: List[str]) -> s
     )
 
 
+def format_retrieved_chunks_for_output(results: List[str]) -> str:
+    if not results:
+        return "No relevant information found."
+    return "\n".join(f"{i}. {chunk}" for i, chunk in enumerate(results, start=1))
+
+
+def build_rerank_style_result_row(
+    profile: Dict[str, Any],
+    query: str,
+    retrieved_chunks: List[str],
+    final_response: str,
+) -> Dict[str, Any]:
+    return {
+        "User_ID": profile.get("id", "Unknown"),
+        "User_Name": profile.get("name", "Unknown"),
+        "User_Age": profile.get("age", "Unknown"),
+        "User_Gender": profile.get("gender", "Unknown"),
+        "User_Nationality": profile.get("nationality", "Unknown"),
+        "User_Travel_Style": profile.get("travel_style", "Unknown"),
+        "User_Persona": profile.get("persona", "Unknown"),
+        "User_Likes": str(profile.get("likes", [])),
+        "User_Dislikes": str(profile.get("dislikes", [])),
+        "User_Price_Preference": profile.get("price_preference", "Unknown"),
+        "User_Min_Rating": profile.get("min_rating", "Unknown"),
+        "User_Input": query,
+        "Relevant_Information": format_retrieved_chunks_for_output(retrieved_chunks),
+        "LLM_Response": final_response,
+    }
+
+
+def write_results_csv(rows: List[Dict[str, Any]], path: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=RERANK_OUTPUT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in RERANK_OUTPUT_FIELDS})
+
+
+def write_results_json(rows: List[Dict[str, Any]], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+
 def build_inputs(system_prompt: str, user_input: str, tokenizer):
     messages = [
         {"role": "system", "content": system_prompt},
@@ -110,7 +335,7 @@ def load_model_and_tokenizer(model_id: str, gpu_memory_gib: int):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -173,6 +398,9 @@ def generate_response(
     }
     if do_sample:
         gen_kwargs["temperature"] = temperature
+    else:
+        gen_kwargs["temperature"] = 1.0
+        gen_kwargs["top_p"] = 1.0
 
     with torch.no_grad():
         outputs = model.generate(**inputs, **gen_kwargs)
@@ -253,18 +481,26 @@ def run_single_model(
     sanitized_model_name = re.sub(r"[/:.]", "_", model_id)
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
 
-    jsonl_path = os.path.join(args.output_dir, f"base_eval_raw_{sanitized_model_name}_{timestamp}.jsonl")
-    raw_only_path = os.path.join(args.output_dir, f"base_eval_raw_unparsed_{sanitized_model_name}_{timestamp}.jsonl")
-    csv_path = os.path.join(args.output_dir, f"base_eval_summary_{sanitized_model_name}_{timestamp}.csv")
-    metadata_path = os.path.join(args.output_dir, f"base_eval_metadata_{sanitized_model_name}_{timestamp}.json")
-    performance_path = os.path.join(args.output_dir, f"base_eval_performance_{sanitized_model_name}_{timestamp}.jsonl")
+    results_json_path = os.path.join(args.output_dir, f"base_eval_results_{sanitized_model_name}_{timestamp}.json")
+    results_csv_path = os.path.join(args.output_dir, f"base_eval_results_{sanitized_model_name}_{timestamp}.csv")
+    performance_json_path = os.path.join(
+        args.output_dir,
+        f"base_eval_performance_{sanitized_model_name}_{timestamp}.json",
+    )
 
     print(f"\n{'='*60}")
     print(f"Model        : {model_id}")
-    print(f"Output JSONL : {jsonl_path}")
-    print(f"Output CSV   : {csv_path}")
-    print(f"Performance  : {performance_path}")
+    print(f"Output JSON  : {results_json_path}")
+    print(f"Output CSV   : {results_csv_path}")
+    print(f"Performance  : {performance_json_path}")
     print(f"{'='*60}")
+
+    _reset_cuda_peak_stats()
+    rusage_start = _get_rusage_snapshot()
+    cuda_start = _get_cuda_memory_snapshot()
+    nvidia_smi_start = _get_nvidia_smi_snapshot()
+    wall_start = time.perf_counter()
+    cpu_start = time.process_time()
 
     model = None
     tokenizer = None
@@ -282,14 +518,11 @@ def run_single_model(
         "dislike_avoid_rate_count": 0,
     }
 
-    summary_rows: List[Dict[str, Any]] = []
+    results_rows: List[Dict[str, Any]] = []
+    per_profile_performance_rows: List[Dict[str, Any]] = []
 
-    with open(jsonl_path, "w", encoding="utf-8") as jsonl_f, \
-         open(raw_only_path, "w", encoding="utf-8") as raw_f, \
-         open(performance_path, "w", encoding="utf-8") as perf_f:
-
-        pbar = tqdm(profiles, desc=f"Evaluating {sanitized_model_name[:30]}", unit="profile", dynamic_ncols=True)
-        for idx, profile in enumerate(pbar):
+    pbar = tqdm(profiles, desc=f"Evaluating {sanitized_model_name[:30]}", unit="profile", dynamic_ncols=True)
+    for profile in pbar:
             query = profile.get("input", "What do you recommend?")
 
             retrieved = retrieve_chunks(query, faiss_index, chunks, embed_model, args.retrieval_top_k)
@@ -308,6 +541,8 @@ def run_single_model(
                     temperature=args.temperature,
                 )
 
+            final_response = strip_think_sections(final_response)
+
             metrics = compute_response_metrics(final_response, profile)
 
             aggregate["rows"] += 1
@@ -321,33 +556,13 @@ def run_single_model(
                 aggregate["dislike_avoid_rate_sum"] += metrics["dislike_avoid_rate"]
                 aggregate["dislike_avoid_rate_count"] += 1
 
-            record = {
-                "user_id": profile.get("id"),
-                "query": query,
-                "profile": {
-                    "name": profile.get("name"),
-                    "persona": profile.get("persona"),
-                    "travel_style": profile.get("travel_style"),
-                    "likes": profile.get("likes", []),
-                    "dislikes": profile.get("dislikes", []),
-                    "price_preference": profile.get("price_preference"),
-                    "min_rating": profile.get("min_rating"),
-                },
-                "retrieved_chunks": retrieved,
-                "final_response": final_response,
-            }
-            jsonl_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            jsonl_f.flush()
-
-            raw_only_record = {
-                "user_id": profile.get("id"),
-                "query": query,
-                "system_prompt": SYSTEM_PROMPT,
-                "user_prompt": user_prompt,
-                "final_response": final_response,
-            }
-            raw_f.write(json.dumps(raw_only_record, ensure_ascii=False) + "\n")
-            raw_f.flush()
+            results_row = build_rerank_style_result_row(
+                profile=profile,
+                query=query,
+                retrieved_chunks=retrieved,
+                final_response=final_response,
+            )
+            results_rows.append(results_row)
 
             perf_record = {
                 "user_id": profile.get("id"),
@@ -355,27 +570,11 @@ def run_single_model(
                 "persona": profile.get("persona"),
                 **metrics,
             }
-            perf_f.write(json.dumps(perf_record, ensure_ascii=False) + "\n")
-            perf_f.flush()
+            per_profile_performance_rows.append(perf_record)
 
-            summary_row: Dict[str, Any] = {
-                "user_id": profile.get("id"),
-                "name": profile.get("name"),
-                "persona": profile.get("persona"),
-                "travel_style": profile.get("travel_style"),
-                "query": query,
-                "word_count": metrics["word_count"],
-                "is_empty": metrics["is_empty"],
-                "preference_mention_rate": metrics["preference_mention_rate"],
-                "dislike_avoid_rate": metrics["dislike_avoid_rate"],
-                "likes_mentioned": metrics["likes_mentioned"],
-                "total_likes": metrics["total_likes"],
-                "response_preview": final_response[:200].replace("\n", " "),
-            }
-            summary_rows.append(summary_row)
-
-            if (idx + 1) % args.save_every == 0:
-                write_summary_csv(summary_rows, csv_path)
+            if len(results_rows) % args.save_every == 0:
+                write_results_csv(results_rows, results_csv_path)
+                write_results_json(results_rows, results_json_path)
 
             rows_so_far = max(1, aggregate["rows"])
             pmr = aggregate["preference_mention_rate_sum"] / max(1, aggregate["preference_mention_rate_count"])
@@ -387,22 +586,46 @@ def run_single_model(
                 "empty": aggregate["empty_responses"],
             })
 
-    write_summary_csv(summary_rows, csv_path)
+    write_results_csv(results_rows, results_csv_path)
+    write_results_json(results_rows, results_json_path)
 
     rows = max(1, aggregate["rows"])
     pmr_count = max(1, aggregate["preference_mention_rate_count"])
     dar_count = max(1, aggregate["dislike_avoid_rate_count"])
 
     aggregate_performance = {
-        "_type": "aggregate",
         "rows_processed": aggregate["rows"],
         "empty_response_rate": aggregate["empty_responses"] / rows,
         "avg_word_count": aggregate["word_count_sum"] / rows,
         "avg_preference_mention_rate": aggregate["preference_mention_rate_sum"] / pmr_count,
         "avg_dislike_avoid_rate": aggregate["dislike_avoid_rate_sum"] / dar_count,
     }
-    with open(performance_path, "a", encoding="utf-8") as perf_f:
-        perf_f.write(json.dumps(aggregate_performance, ensure_ascii=False) + "\n")
+
+    wall_elapsed = time.perf_counter() - wall_start
+    cpu_elapsed = time.process_time() - cpu_start
+    rusage_end = _get_rusage_snapshot()
+    cuda_end = _get_cuda_memory_snapshot()
+    nvidia_smi_end = _get_nvidia_smi_snapshot()
+
+    performance_payload = {
+        "model_id": model_id,
+        "timestamp_utc": datetime.now(UTC).isoformat(),
+        "aggregate_metrics": aggregate_performance,
+        "per_profile_metrics": per_profile_performance_rows,
+        "system_performance": {
+            "rows_processed": aggregate["rows"],
+            "wall_time_seconds": round(wall_elapsed, 4),
+            "cpu_time_seconds": round(cpu_elapsed, 4),
+            "rusage_start": rusage_start,
+            "rusage_end": rusage_end,
+            "cuda_start": cuda_start,
+            "cuda_end": cuda_end,
+            "nvidia_smi_start": nvidia_smi_start,
+            "nvidia_smi_end": nvidia_smi_end,
+        },
+    }
+    with open(performance_json_path, "w", encoding="utf-8") as f:
+        json.dump(performance_payload, f, ensure_ascii=False, indent=2)
 
     metadata = {
         "timestamp_utc": datetime.now(UTC).isoformat(),
@@ -413,19 +636,23 @@ def run_single_model(
         "chunks_file": args.chunks_file,
         "embed_model": args.embed_model,
         "retrieval_top_k": args.retrieval_top_k,
-        "performance_jsonl": performance_path,
+        "results_json": results_json_path,
+        "results_csv": results_csv_path,
+        "performance_json": performance_json_path,
         "rows_processed": aggregate["rows"],
+        "avg_word_count": aggregate_performance["avg_word_count"],
+        "avg_preference_mention_rate": aggregate_performance["avg_preference_mention_rate"],
+        "avg_dislike_avoid_rate": aggregate_performance["avg_dislike_avoid_rate"],
         "do_sample": args.do_sample,
         "temperature": args.temperature,
         "max_new_tokens": args.max_new_tokens,
     }
 
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
-
     print(f"\nModel {model_id} complete.")
     print(json.dumps(metadata, indent=2))
-    print(f"Metadata: {metadata_path}")
+    print(f"Results JSON: {results_json_path}")
+    print(f"Results CSV: {results_csv_path}")
+    print(f"Performance JSON: {performance_json_path}")
 
     if model is not None:
         del model, tokenizer
@@ -454,6 +681,15 @@ def run(args: argparse.Namespace) -> None:
 
     print(f"Loading embedding model: {args.embed_model}")
     embed_model = load_embedding_model(args.embed_model)
+    embed_dim = get_embedding_dimension(embed_model)
+    print(f"Embedding dimension: {embed_dim} | FAISS index dimension: {faiss_index.d}")
+    if embed_dim != faiss_index.d:
+        raise ValueError(
+            "Embedding dimension mismatch: "
+            f"index expects {faiss_index.d}, but model '{args.embed_model}' outputs {embed_dim}. "
+            "Use an embedding model with matching dimension (for a 768-d index, "
+            "try 'sentence-transformers/all-mpnet-base-v2')."
+        )
 
     print(f"\nLoaded {len(profiles)} profiles. Running {len(args.model_ids)} model(s).")
 
@@ -486,13 +722,13 @@ def parse_args() -> argparse.Namespace:
         ],
         help="One or more HuggingFace model IDs to evaluate sequentially.",
     )
-    parser.add_argument("--profiles-file", type=str, default="user_profiles.json")
+    parser.add_argument("--profiles-file", type=str, default="split_3_non_matching.csv")
     parser.add_argument("--faiss-index", type=str, default="faiss_index.bin")
     parser.add_argument("--chunks-file", type=str, default="chunks.npy")
     parser.add_argument(
         "--embed-model",
         type=str,
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="sentence-transformers/all-mpnet-base-v2",
         help="Sentence-transformers model used to embed queries for FAISS retrieval.",
     )
     parser.add_argument("--retrieval-top-k", type=int, default=5, help="Number of chunks to retrieve per query.")
