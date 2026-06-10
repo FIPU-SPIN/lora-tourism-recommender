@@ -14,3 +14,4 @@ adapters_results
 base_eval_min.*
 tourism_adapter_train_min.*
 tourism_ia3_train_min.*
+adapter_eval_nm.o960955
