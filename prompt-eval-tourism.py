@@ -323,6 +323,31 @@ def build_inputs(system_prompt: str, user_input: str, tokenizer):
     return inputs
 
 
+def resolve_max_new_tokens(
+    context_length: int,
+    input_length: int,
+    requested_limit: Optional[int],
+) -> int:
+    available = context_length - input_length
+    if available <= 0:
+        raise ValueError(
+            f"Prompt length ({input_length} tokens) reaches or exceeds the "
+            f"model context length ({context_length} tokens)."
+        )
+    if requested_limit is not None:
+        return min(available, requested_limit)
+    return available
+
+
+def model_context_length(model) -> int:
+    context_length = getattr(model.config, "max_position_embeddings", None)
+    if context_length is None:
+        context_length = getattr(model.config, "n_positions", None)
+    if not isinstance(context_length, int) or context_length <= 0:
+        raise ValueError("Could not determine the model's maximum context length.")
+    return context_length
+
+
 def load_model_and_tokenizer(model_id: str, offload_folder: str, gpu_memory_gib: int):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -381,12 +406,15 @@ def generate_response(
     tokenizer,
     system_prompt: str,
     user_prompt: str,
-    max_new_tokens: int,
+    max_new_tokens: Optional[int],
     do_sample: bool,
     temperature: float,
 ) -> str:
     inputs = build_inputs(system_prompt, user_prompt, tokenizer)
     input_len = inputs["input_ids"].shape[-1]
+    max_new_tokens = resolve_max_new_tokens(
+        model_context_length(model), input_len, max_new_tokens
+    )
     inputs = inputs.to(model.device)
 
     gen_kwargs = {
@@ -411,7 +439,7 @@ def batch_generate_transformers(
     tokenizer,
     system_prompt: str,
     user_prompts: List[str],
-    max_new_tokens: int,
+    max_new_tokens: Optional[int],
     do_sample: bool,
     temperature: float,
 ) -> List[str]:
@@ -445,6 +473,9 @@ def batch_generate_transformers(
         return_tensors="pt",
         padding=True,
         truncation=True,
+    )
+    max_new_tokens = resolve_max_new_tokens(
+        model_context_length(model), inputs["input_ids"].shape[1], max_new_tokens
     )
     input_lens = inputs["attention_mask"].sum(dim=1)
     inputs = inputs.to(model.device)
@@ -514,16 +545,12 @@ def batch_generate_vllm(
     llm,
     system_prompt: str,
     user_prompts: List[str],
-    max_new_tokens: int,
+    max_new_tokens: Optional[int],
     do_sample: bool,
     temperature: float,
+    max_model_len: int,
 ) -> List[str]:
     from vllm import SamplingParams
-
-    sampling_params = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=temperature if do_sample else 0.0,
-    )
 
     conversations = [
         [
@@ -532,6 +559,24 @@ def batch_generate_vllm(
         ]
         for up in user_prompts
     ]
+
+    tokenizer = llm.get_tokenizer()
+    sampling_params = []
+    for conversation in conversations:
+        prompt_tokens = tokenizer.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            tokenize=True,
+        )
+        generation_limit = resolve_max_new_tokens(
+            max_model_len, len(prompt_tokens), max_new_tokens
+        )
+        sampling_params.append(
+            SamplingParams(
+                max_tokens=generation_limit,
+                temperature=temperature if do_sample else 0.0,
+            )
+        )
 
     # Disable Qwen3 chain-of-thought thinking if the chat template supports it.
     try:
@@ -920,6 +965,7 @@ def run(args: argparse.Namespace) -> None:
             max_new_tokens=args.max_new_tokens,
             do_sample=args.do_sample,
             temperature=args.temperature,
+            max_model_len=args.vllm_max_model_len,
         )
         print("Generation complete.")
     elif active_backend == "transformers" and not args.no_model:
@@ -1202,7 +1248,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tourism prompt evaluation on Pula datasets")
-    parser.add_argument("--model-id", type=str, default="Qwen/Qwen3.6-35B-A3B")
+    parser.add_argument("--model-id", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--places-file", type=str, default="pula_merged.json")
     parser.add_argument("--profiles-file", type=str, default="user_profiles.json")
     parser.add_argument("--labels-file", type=str, default="")
@@ -1210,7 +1256,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--candidate-limit", type=int, default=60)
     parser.add_argument("--max-profiles", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=450)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Optional output token cap. By default, generation can use the remaining model context.",
+    )
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--strict-price", action="store_true")

@@ -23,7 +23,7 @@ SYSTEM_PROMPT = (
     "You are an intelligent tourism assistant. You recommend personalized activities to tourists based on:\n"
     "1. The user's interests and preferences (as defined in their profile).\n"
     "2. Their current intent or question (described in the user input).\n"
-    "3. Relevant local information retrieved via semantic search (provided as bullet points).\n"
+    "3. Relevant local information retrieved v   semantic search (provided as bullet points).\n"
     "Your response should be personalized, context-aware, and practical.\n"
     "If there are strong user preferences, make sure to respect them.\n"
     "Respond in a friendly and informative tone. Your output should be a short and clear activity recommendation, "
@@ -142,24 +142,33 @@ def _get_nvidia_smi_snapshot() -> Dict[str, Any]:
     except Exception as exc:
         return {"available": False, "error": str(exc), "gpus": []}
 
+    def _safe_float(val: str) -> Optional[float]:
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
     gpus = []
     for line in out.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) != 9:
             continue
-        gpus.append(
-            {
-                "index": int(parts[0]),
-                "name": parts[1],
-                "gpu_utilization_percent": float(parts[2]),
-                "memory_utilization_percent": float(parts[3]),
-                "memory_total_mib": float(parts[4]),
-                "memory_used_mib": float(parts[5]),
-                "memory_free_mib": float(parts[6]),
-                "temperature_c": float(parts[7]),
-                "power_draw_w": float(parts[8]),
-            }
-        )
+        try:
+            gpus.append(
+                {
+                    "index": int(parts[0]),
+                    "name": parts[1],
+                    "gpu_utilization_percent": _safe_float(parts[2]),
+                    "memory_utilization_percent": _safe_float(parts[3]),
+                    "memory_total_mib": _safe_float(parts[4]),
+                    "memory_used_mib": _safe_float(parts[5]),
+                    "memory_free_mib": _safe_float(parts[6]),
+                    "temperature_c": _safe_float(parts[7]),
+                    "power_draw_w": _safe_float(parts[8]),
+                }
+            )
+        except Exception:
+            continue
     return {"available": True, "gpus": gpus}
 
 
@@ -250,26 +259,36 @@ def load_model_and_tokenizer(base_model_id: str, adapter_dir: str, gpu_memory_gi
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
     )
 
+    load_kwargs = {
+        "quantization_config": bnb_config,
+        "trust_remote_code": True,
+        "dtype": torch.float16,
+    }
+
     if n_gpus >= 2:
-        load_kwargs = {
-            "quantization_config": bnb_config,
-            "device_map": "auto",
-            "trust_remote_code": True,
-        }
+        load_kwargs["device_map"] = "auto"
     else:
-        load_kwargs = {
-            "quantization_config": bnb_config,
-            "device_map": {"": 0},
-            "max_memory": {0: f"{gpu_memory_gib}GiB"},
-            "trust_remote_code": True,
-        }
+        load_kwargs["device_map"] = {"": 0}
+        load_kwargs["max_memory"] = {0: f"{gpu_memory_gib}GiB"}
 
     base_model = AutoModelForCausalLM.from_pretrained(base_model_id, **load_kwargs)
     model = PeftModel.from_pretrained(base_model, adapter_dir)
+
+    # IA3 scaling vectors (stored in ia3_l ParameterDict) load as float32 by
+    # default. The bitsandbytes layers output float16 (bnb_4bit_compute_dtype),
+    # so multiplying by a float32 scaling vector upcasts key/value to float32
+    # while query stays float16, causing the attention dtype mismatch.
+    # Cast them directly by name rather than iterating all parameters (which
+    # would conflict with Params4bit internals).
+    for module in model.modules():
+        if hasattr(module, 'ia3_l'):
+            for adapter_param in module.ia3_l.values():
+                adapter_param.data = adapter_param.data.to(torch.float16)
+
     model.eval()
     return model, tokenizer
 
@@ -279,7 +298,6 @@ def generate_response(
     tokenizer,
     system_prompt: str,
     user_prompt: str,
-    max_new_tokens: int,
     do_sample: bool,
     temperature: float,
 ) -> str:
@@ -304,14 +322,14 @@ def generate_response(
     inputs = inputs.to(model.device)
 
     gen_kwargs: Dict[str, Any] = {
-        "max_new_tokens": max_new_tokens,
+        "max_length": model.config.max_position_embeddings,
         "do_sample": do_sample,
         "pad_token_id": tokenizer.eos_token_id,
     }
     if do_sample:
         gen_kwargs["temperature"] = temperature
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         outputs = model.generate(**inputs, **gen_kwargs)
 
     new_tokens = outputs[0][input_len:]
@@ -482,7 +500,6 @@ def evaluate_adapter(
             tokenizer=tokenizer,
             system_prompt=SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            max_new_tokens=args.max_new_tokens,
             do_sample=args.do_sample,
             temperature=args.temperature,
         )
@@ -566,12 +583,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adapter-filter",
         type=str,
-        default="",
-        help="Optional comma-separated adapter directory names to evaluate.",
+        default="ia3-qwen3-4b,lora-llama3.1,lora-llama3.2,lora-qwen3-4b",
+        help=(
+            "Comma-separated adapter directory names to evaluate. Defaults to the adapters "
+            "without a completed non-matching evaluation."
+        ),
     )
     parser.add_argument("--max-rows", type=int, default=None)
 
-    parser.add_argument("--max-new-tokens", type=int, default=220)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--gpu-memory-gib", type=int, default=36)
@@ -614,6 +633,14 @@ def main() -> None:
                     "error": str(exc),
                 }
             )
+            # Attempt CUDA state recovery so subsequent adapters can still run.
+            try:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
             continue
 
         adapter_name = summary["adapter_name"]

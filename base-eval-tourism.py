@@ -323,6 +323,7 @@ def build_inputs(system_prompt: str, user_input: str, tokenizer):
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
+            chat_template_kwargs={"enable_thinking": False},
         )
     except Exception as e:
         print(f"Warning: No chat template found, using fallback. Error: {e}")
@@ -406,6 +407,15 @@ def generate_response(
         outputs = model.generate(**inputs, **gen_kwargs)
 
     new_tokens = outputs[0][input_len:]
+    if (
+        0 < max_new_tokens <= len(new_tokens)
+        and tokenizer.eos_token_id is not None
+        and new_tokens[-1].item() != tokenizer.eos_token_id
+    ):
+        print(
+            f"Warning: response reached max_new_tokens={max_new_tokens}; "
+            "the response may be truncated."
+        )
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
@@ -734,7 +744,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-top-k", type=int, default=5, help="Number of chunks to retrieve per query.")
     parser.add_argument("--output-dir", type=str, default="./base_results")
     parser.add_argument("--max-profiles", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=300)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--save-every", type=int, default=25)

@@ -10,7 +10,6 @@ import numpy as np
 from datetime import datetime
 import logging
 
-
 load_dotenv() 
 INDEX_FILE = "faiss_index.bin"
 CHUNKS_FILE = "chunks.npy"
