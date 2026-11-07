@@ -17,7 +17,7 @@ from datasets import Dataset
 from huggingface_hub import login
 from peft import IA3Config
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from trl import SFTConfig, SFTTrainer
+from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
 
 PRICE_ORDER = {"low": 0, "medium": 1, "high": 2}
 
@@ -162,10 +162,39 @@ def load_faiss_index(index_path: str, chunks_path: str):
     return index, chunks
 
 
+NOMIC_EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+
+
 def load_embedding_model(model_name: str):
+    """Load the query embedding model.
+
+    The FAISS index was built with nomic-embed-text v1.5 (through Ollama), so the
+    queries must be embedded with the same model. Use "ollama:<model>" (for example
+    "ollama:nomic-embed-text:latest") to embed through a running Ollama server,
+    exactly as when the index was built; otherwise the Hugging Face version of the
+    model is loaded with sentence-transformers.
+    """
+    if model_name.startswith("ollama:"):
+        return ("ollama", model_name.split(":", 1)[1])
+
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(model_name)
+    return SentenceTransformer(model_name, trust_remote_code=True)
+
+
+def embed_query(embed_model, query: str):
+    """Return the query embedding as a float32 array of shape (1, dim)."""
+    import numpy as np
+
+    if isinstance(embed_model, tuple) and embed_model[0] == "ollama":
+        import ollama
+
+        response = ollama.embed(model=embed_model[1], input=query)
+        return np.array(response["embeddings"], dtype="float32").reshape(1, -1)
+
+    return embed_model.encode(
+        [query], convert_to_numpy=True, normalize_embeddings=True
+    ).astype("float32")
 
 
 def retrieve_chunks(
@@ -175,7 +204,7 @@ def retrieve_chunks(
     embed_model,
     top_k: int,
 ) -> List[str]:
-    embedding = embed_model.encode([query], convert_to_numpy=True).astype("float32")
+    embedding = embed_query(embed_model, query)
     _, indices = index.search(embedding, top_k)
     results = []
     for idx in indices[0]:
@@ -735,6 +764,26 @@ def _get_nvidia_smi_snapshot() -> Dict[str, Any]:
     return {"available": True, "gpus": gpus}
 
 
+def build_response_collator(tokenizer):
+    """Data collator that computes the loss only on the assistant response.
+
+    The prompt (system prompt, user profile, question and retrieved records) is
+    still part of the input, but its tokens are ignored in the loss, so the adapter
+    learns to write the response rather than to reproduce the prompt.
+    The text that starts the assistant turn is taken from the model's own chat
+    template, so the same code works for Llama and Qwen.
+    """
+    probe = [{"role": "user", "content": "x"}]
+    without_prompt = tokenizer.apply_chat_template(probe, tokenize=False, add_generation_prompt=False)
+    with_prompt = tokenizer.apply_chat_template(probe, tokenize=False, add_generation_prompt=True)
+    response_template = with_prompt[len(without_prompt):].rstrip()
+    if not response_template:
+        raise ValueError("Could not find the assistant header in the chat template.")
+    response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)
+    print(f"Loss is computed only after the response template: {response_template!r}")
+    return DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer=tokenizer)
+
+
 def train_single_model(
     args: argparse.Namespace,
     model_id: str,
@@ -836,6 +885,9 @@ def train_single_model(
         peft_config=peft_config,
         tokenizer=tokenizer,
         args=sft_config,
+        # Previously no data collator was given, so the loss was computed over the
+        # whole sequence (prompt and response). Now only the response counts.
+        data_collator=build_response_collator(tokenizer),
     )
 
     is_main_process = trainer.is_world_process_zero()
@@ -941,7 +993,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-dataset-file", type=str, default="split_2_both1_870.csv")
     parser.add_argument("--faiss-index", type=str, default="faiss_index.bin")
     parser.add_argument("--chunks-file", type=str, default="chunks.npy")
-    parser.add_argument("--embed-model", type=str, default="sentence-transformers/all-mpnet-base-v2")
+    parser.add_argument("--embed-model", type=str, default=NOMIC_EMBED_MODEL)
     parser.add_argument("--retrieval-top-k", type=int, default=5)
     parser.add_argument(
         "--teaching-dataset-file",
@@ -957,7 +1009,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-profiles", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--max-length", type=int, default=512)
+    # parser.add_argument("--max-length", type=int, default=512)
+    # 512 was used for the results in the paper. It cut almost every training example
+    # (about 1790 tokens on average with 5 retrieved records, up to about 3400), so the
+    # reference response was usually not part of the training sequence.
+    # 6144 covers the longest examples with room for longer ones in the future.
+    parser.add_argument("--max-length", type=int, default=6144)
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--per-device-eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)

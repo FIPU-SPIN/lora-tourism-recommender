@@ -278,7 +278,7 @@ def main():
             user_price_preference = user_profile.get("price_preference", "Unknown")
             user_min_rating = user_profile.get("min_rating", "Unknown")
 
-            faiss_results = search_with_faiss(user_input, index, chunks, initial_k=30, final_k=10)
+            faiss_results = search_with_faiss(user_input, index, chunks, initial_k=30, final_k=5)
             if not faiss_results:
                 print("No results found from FAISS search.")
                 continue
